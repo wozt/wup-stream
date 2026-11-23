@@ -325,6 +325,8 @@ int main(void) {
     wup_audio_open();
     draw_waiting();
     unsigned held = wup_buttons();
+    u32 quit_combo_since = 0;
+    int quit_combo_active = 0;
     static u8 buf[1536] __attribute__((aligned(4)));
     for (;;) {
         wup_sleep(peer_on ? 1 : 16);                         /* (the firmware's tasks run in here; the network in its own threads) */
@@ -339,8 +341,21 @@ int main(void) {
             tick(clock_ms());
         }
         unsigned b = wup_buttons(), pressed = b & ~held; held = b;
-        if (!peer_on && (pressed & WUP_B)) break;            /* (while a stream runs, the buttons are the computer's) */
-        (void)now;
+        if (!peer_on && (pressed & WUP_B)) break;  /* B alone: only while waiting */
+        /* Local emergency exit: HOME + B continuously for 2 seconds.
+           Never intercept either key alone; reset timer when either is released.
+           u32 subtraction handles clock_ms() wraparound. */
+        if ((b & (WUP_HOME | WUP_B)) == (WUP_HOME | WUP_B)) {
+            if (!quit_combo_active) {
+                quit_combo_active = 1;
+                quit_combo_since = now;
+            } else if ((u32)(now - quit_combo_since) >= 2000u) {
+                wup_log("wupstream: quit via HOME+B");
+                break;
+            }
+        } else {
+            quit_combo_active = 0;
+        }
     }
     if (peer_on) end_session();
     return 0;

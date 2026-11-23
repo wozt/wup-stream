@@ -58,6 +58,8 @@ Open it from the Homebrew Menu ("Waiting for a Stream"), then start a program he
 (Nintendo's last) is supported. (The first pad side, a firmware of its own with a text menu and its own network stack,
 is in this repository's history.)
 
+While WUP Stream is running, hold **HOME + B for 2 seconds** to quit and return to the Homebrew Menu, even during an active stream. When waiting for a stream, **B** alone still exits.
+
 ## Examples
 
 `host/examples`: `sketch.c` (draw on the GamePad with your finger: touch, buttons, sound, rumble) and `pipe.c` (video
