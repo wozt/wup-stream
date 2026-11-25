@@ -91,6 +91,7 @@ int main(int argc, char **argv) {
         if (wupstream_frame(pad, px, WUPSTREAM_W * 4, WUPSTREAM_RGBA) || wupstream_audio(pad, au, na)) break;
         if (t % 300 == 0) { fprintf(stderr, "mirror: %u camera frames, %u microphone samples\n", frames, samples); }
     }
+    fprintf(stderr, "mirror: ended: %s\n", wupstream_input(pad, &st) ? "the pad stopped answering" : st.buttons & WUPSTREAM_HOME ? "HOME" : "sending failed");
     wupstream_close(pad);
     kill(pid, SIGTERM);
     return 0;
