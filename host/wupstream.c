@@ -47,9 +47,10 @@ struct wupstream {
     int16_t micbuf[48000]; int mic_w, mic_n;                 /* the last second of the microphone */
     /* the camera: the frame being put together from its parts, then up to CAMQ whole ones waiting to be read */
     #define CAMQ 16
-    int cam, cam_parts, cam_len, cam_r, cam_n, cam_fn, cam_lost;
+    int cam, cam_parts, cam_len, cam_r, cam_n, cam_fn, cam_lost, cam_run, cam_run_out;   /* run: the encoder's start (-1: none yet) */
+    int cam_cur, cam_ok, cam_restarts, cam_dropn, cam_idr; uint32_t cam_next; double cam_asked;       /* the run being followed: in step? */
     uint32_t cam_frame; uint64_t cam_got;
-    uint8_t cam_asm[65536]; struct { int len; uint8_t d[65536]; } camq[CAMQ];            /* frames waiting on the pad: this refresh, the last */
+    uint8_t cam_asm[65536]; struct { int len, run; uint8_t d[65536]; } camq[CAMQ];            /* frames waiting on the pad: this refresh, the last */
 };
 
 static void put(wupstream *w, const void *d, int n) { sendto(w->sock, (const char *)d, n, 0, (struct sockaddr *)&w->pad, sizeof w->pad); }
@@ -100,19 +101,28 @@ static void pump(wupstream *w) {                               /* what the pad s
             w->micbuf[w->mic_w] = (int16_t)(b[i] | b[i + 1] << 8); w->mic_w = (w->mic_w + 1) % 48000;
             if (w->mic_n < 48000) w->mic_n++;
         }
-        if (b[0] == 'C' && n > 8 && n <= 8 + 1024 && b[3] && b[3] <= 64 && b[2] < b[3]) {   /* the camera: part b[2] of b[3] */
+        if (b[0] == 'C' && n > 8 && n <= 8 + 1024 && b[3] && b[3] <= 64 && b[2] < b[3] && !(w->cam_dropn && rand() % w->cam_dropn == 0)) {
+            /* the camera: part b[2] of b[3] of frame f of run b[1] */
             uint32_t f; memcpy(&f, b + 4, 4);
             if (f != w->cam_frame || b[3] != w->cam_parts) {              /* a new frame (the last, if not whole: lost) */
                 if (w->cam_got) w->cam_lost++;
-                w->cam_frame = f; w->cam_parts = b[3]; w->cam_got = 0; w->cam_len = 0;
+                w->cam_frame = f; w->cam_parts = b[3]; w->cam_got = 0; w->cam_len = 0; w->cam_run = b[1];
             }
             memcpy(w->cam_asm + 1024 * b[2], b + 8, (size_t)n - 8);
             w->cam_got |= 1ull << b[2];
             if (b[2] == b[3] - 1) w->cam_len = 1024 * b[2] + n - 8;
             if (w->cam_got == (b[3] == 64 ? ~0ull : (1ull << b[3]) - 1) && w->cam_len) {
-                if (w->cam_n == CAMQ) { w->cam_r = (w->cam_r + 1) % CAMQ; w->cam_n--; w->cam_lost++; }   /* (not read: the oldest goes) */
-                int q = (w->cam_r + w->cam_n++) % CAMQ;
-                w->camq[q].len = w->cam_len; memcpy(w->camq[q].d, w->cam_asm, (size_t)w->cam_len);
+                /* A whole frame. A run's first frame is a keyframe, each later one needs all before it, and nothing
+                   repairs a lost one: only frames in step are passed on (a run from its frame 0, then each in turn);
+                   out of step (a frame lost, or not read here in time), the pad is asked to start its encoder again
+                   ('K') and the reader gets nothing until the new run's first frame: its picture stands still. */
+                if (w->cam_run != w->cam_cur) { w->cam_cur = w->cam_run; w->cam_next = 0; w->cam_ok = 1; }
+                if (f != w->cam_next || w->cam_n == CAMQ) w->cam_ok = 0;
+                if (w->cam_ok) {
+                    int q = (w->cam_r + w->cam_n++) % CAMQ;
+                    w->camq[q].len = w->cam_len; w->camq[q].run = w->cam_run; memcpy(w->camq[q].d, w->cam_asm, (size_t)w->cam_len);
+                    w->cam_next = f + 1;
+                } else w->cam_lost++;
                 w->cam_got = 0; w->cam_parts = 0;
             }
         }
@@ -126,6 +136,7 @@ static void pump(wupstream *w) {                               /* what the pad s
         }
     }
     double t = now();
+    if (w->cam && !w->cam_ok && w->cam_cur >= 0 && t - w->cam_asked > 0.3) { put(w, "K\0\0", 4); w->cam_asked = t; w->cam_restarts++; }
     if (t - w->last_hello > 0.25) { char h[4] = { 'H', 1, (char)(w->mic | w->cam << 1), (char)w->light }; put(w, h, 4); w->last_hello = t; }
     if (w->have && t - w->last_in > 2 && !w->gone) { w->gone = 1; if (w->started) pthread_cond_broadcast(&w->cv); }     /* the pad stopped answering (or left the stream) */
 }
@@ -135,7 +146,7 @@ wupstream *wupstream_open(const char *ip, int timeout_ms) {
 #ifdef _WIN32
     WSADATA wd; WSAStartup(MAKEWORD(2, 2), &wd); timeBeginPeriod(1);
 #endif
-    wupstream *w = calloc(1, sizeof *w);
+    wupstream *w = calloc(1, sizeof *w); if (w) { w->cam_run_out = w->cam_cur = -1; w->cam_ok = 1; if (getenv("WUPSTREAM_CAMDROP")) w->cam_dropn = atoi(getenv("WUPSTREAM_CAMDROP")); }
     w->sock = (int)socket(AF_INET, SOCK_DGRAM, 0);                   /* (its own port: several GamePads, several programs) */
     struct sockaddr_in me = { 0 };
     me.sin_family = AF_INET;
@@ -381,11 +392,15 @@ int wupstream_mic(wupstream *w, int16_t *samples, int max) {
 }
 
 /* The GamePad's encoder sends bare slice data (as its decoder takes it): here each frame becomes an access unit of an
-   ordinary H.264 stream: the parameter sets (640 x 480, Main, CABAC, one reference, constrained intra prediction), a P
-   slice header (QP 32, the deblocking filter on, no offsets), then the data with emulation prevention. These settings
+   ordinary H.264 stream: the parameter sets (640 x 480, Main, CABAC, one reference, constrained intra prediction), a
+   slice header (QP 32, the deblocking filter on, no offsets), then the data with emulation prevention. The first frame
+   of every run of the encoder is a keyframe (an I slice, written as an IDR); the rest are P slices. These settings
    are the encoder's own: with them a decoder's picture equals the encoder's reference picture (pulled from the pad's
    memory and compared, 2026-11-24); with constrained intra prediction or the filter off it decodes without an error
    but drifts: flat patches, colours washing out. */
+typedef struct { uint8_t b[8]; int n; } bits_t;
+static void put_bits(bits_t *w, int count, unsigned v) { for (int i = count - 1; i >= 0; i--, w->n++) if (v >> i & 1) w->b[w->n / 8] |= 0x80 >> w->n % 8; }
+static void put_ue(bits_t *w, unsigned v) { int len = 0; for (unsigned t = v + 1; t > 1; t >>= 1) len++; put_bits(w, len, 0); put_bits(w, len + 1, v + 1); }
 int wupstream_camera(wupstream *w, uint8_t *h264, int max) {
     static const uint8_t sets[] = { 0, 0, 0, 1, 0x67, 0x4d, 0x00, 0x1f, 0xda, 0x02, 0x80, 0xf6, 0x40, 0, 0, 0, 1, 0x68, 0xee, 0x06, 0x7a };
     pthread_mutex_lock(&w->mu);
@@ -393,21 +408,20 @@ int wupstream_camera(wupstream *w, uint8_t *h264, int max) {
     pump(w);
     int n = 0;
     while (w->cam_n && !n) {
-        const uint8_t *d = w->camq[w->cam_r].d; int len = w->camq[w->cam_r].len, fn = (w->cam_fn + 1) & 15, z = 0;
-        if (max >= (int)sizeof sets + 1300 + 5 + (len + 3) * 3 / 2) {   /* (room for every byte escaped) */
+        const uint8_t *d = w->camq[w->cam_r].d; int len = w->camq[w->cam_r].len, z = 0;
+        if (w->camq[w->cam_r].run != w->cam_run_out) { w->cam_run_out = w->camq[w->cam_r].run; w->cam_fn = 0; w->cam_idr++; }   /* a run's first frame */
+        if (max >= (int)sizeof sets + 5 + (len + 8) * 3 / 2) {       /* (room for every byte escaped) */
+            int key = !w->cam_fn;
+            bits_t hd = { { 0 }, 0 };
+            put_ue(&hd, 0); put_ue(&hd, key ? 7 : 5); put_ue(&hd, 0); put_bits(&hd, 4, (unsigned)w->cam_fn & 15);   /* first macroblock, I or P, the set, frame_num */
+            if (key) { put_ue(&hd, (unsigned)w->cam_idr & 1); put_bits(&hd, 2, 0); }   /* idr_pic_id (two in a row must differ); no marking */
+            else put_bits(&hd, 3, 0), put_ue(&hd, 0);                /* (one reference, in order, no marking; cabac_init_idc 0) */
+            put_ue(&hd, 0); put_ue(&hd, 0); put_ue(&hd, 0); put_ue(&hd, 0);   /* slice_qp_delta 0; the filter on, both offsets 0 */
+            while (hd.n % 8) put_bits(&hd, 1, 1);                    /* (cabac alignment) */
             memcpy(h264, sets, sizeof sets); n = sizeof sets;
-            if (!w->cam_fn) {
-                /* The encoder makes no keyframe, and a decoder shows nothing before one: the stream begins with a grey
-                   one made here: a second picture parameter set (CAVLC), and an IDR slice whose 1200 macroblocks are
-                   all "intra 16x16, DC, nothing coded" (8 bits each: 0x27, here shifted by the 22-bit slice header). */
-                static const uint8_t grey[] = { 0, 0, 0, 1, 0x68, 0x53, 0x81, 0x9c, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x41, 0x28 };
-                memcpy(h264 + n, grey, sizeof grey); n += sizeof grey;
-                memset(h264 + n, 0x9c, 1199); n += 1199; h264[n++] = 0x9e;
-            }
-            h264[n++] = 0; h264[n++] = 0; h264[n++] = 0; h264[n++] = 1; h264[n++] = 0x61;
-            const uint8_t head[3] = { (uint8_t)(0x9a | fn >> 3), (uint8_t)((fn & 7) << 5 | 0x03), 0xff };
-            for (int i = 0; i < 3 + len; i++) {
-                uint8_t c = i < 3 ? head[i] : d[i - 3];
+            h264[n++] = 0; h264[n++] = 0; h264[n++] = 0; h264[n++] = 1; h264[n++] = key ? 0x65 : 0x61;
+            for (int i = 0; i < hd.n / 8 + len; i++) {
+                uint8_t c = i < hd.n / 8 ? hd.b[i] : d[i - hd.n / 8];
                 if (z >= 2 && c <= 3) { h264[n++] = 3; z = 0; }
                 h264[n++] = c; z = c ? 0 : z + 1;
             }
@@ -438,6 +452,7 @@ void wupstream_close(wupstream *w) {
         pthread_join(w->thread, NULL);
     }
     if (w->pad.sin_addr.s_addr) for (int i = 0; i < 3; i++) put(w, "Q", 1);
+    if (getenv("WUPSTREAM_DEBUG") && w->cam) fprintf(stderr, "wupstream: camera: %d frames not in step (not passed on), %d restarts asked for\n", w->cam_lost, w->cam_restarts);
     if (getenv("WUPSTREAM_DEBUG")) fprintf(stderr, "wupstream: %u frames, %d refreshes skipped for the pad's decoder, refresh %.3f ms, %d refreshes filled with the last picture again, %d packets sent again\n", w->frame, w->skips, w->vper * 1000, w->repeats, w->resent);
     if (w->enc) { x264_picture_clean(&w->pic); x264_encoder_close(w->enc); }
     for (int i = 0; i < 8; i++) free(w->kept[i].data);

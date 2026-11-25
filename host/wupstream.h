@@ -15,7 +15,8 @@
  * Frames are encoded with x264 the way the GamePad's hardware decoder needs them (built into libwupstream.a). The
  * GamePad and this computer must be on the same network.
  * Environment: WUPSTREAM_CRF (quality, lower is better, default 18), WUPSTREAM_KBPS (the most it may use, default
- * 10000), WUPSTREAM_DEBUG=1 (statistics), WUPSTREAM_DROP=n (lose 1 packet in n: a test), WUPSTREAM_X264 (more x264 settings,
+ * 10000), WUPSTREAM_DEBUG=1 (statistics), WUPSTREAM_DROP=n (lose 1 packet in n: a test), WUPSTREAM_CAMDROP=n (1 of the
+ * camera's in n), WUPSTREAM_X264 (more x264 settings,
  * "key=value:..."), WUPSTREAM_DUMP=file (the encoded stream, Annex B). */
 #pragma once
 #include <stdint.h>
@@ -51,9 +52,10 @@ int wupstream_mic(wupstream *w, int16_t *samples, int max);       /* the microph
 int wupstream_camera(wupstream *w, uint8_t *h264, int max);       /* the camera (640 x 480, ~59 frames a second): the next
                                                                       frame as H.264 (Annex B, with its parameter sets), ->
                                                                       its length, 0: none waiting. 100 KB hold any. Call it
-                                                                      often; switched on by the first call. The first is
-                                                                      preceded by a grey keyframe; then none: a lost frame
-                                                                      heals by itself (intra refresh). */
+                                                                      often; switched on by the first call. When a frame
+                                                                      is lost on the way none come for a moment (the pad's
+                                                                      encoder is started again: keep the last picture),
+                                                                      then a keyframe and the frames after it. */
 void wupstream_rumble(wupstream *w, int on);                       /* the motor on or off (it stops by itself if the program does) */
 void wupstream_backlight(wupstream *w, int level, int keep);       /* the screen's brightness, 1..6, or 0: the backlight off,
                                                                       while this program runs; keep: also make it wupstream's
