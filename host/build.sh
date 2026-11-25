@@ -19,5 +19,6 @@ CC=${CC:-cc}
 case "$(uname -s)" in MINGW*|MSYS*) LIBS="-lws2_32 -lwinmm -lpthread";; *) LIBS="-lpthread -ldl";; esac
 $CC -O2 -Wall -I$X -c wupstream.c -o $B/wupstream.o
 cp $X/libx264.a $B/libwupstream.a && ar rs $B/libwupstream.a $B/wupstream.o 2>/dev/null
-for e in sketch pipe; do $CC -O2 -Wall -I. examples/$e.c $B/libwupstream.a -lm $LIBS -o $B/$e; done
-echo "built $B/libwupstream.a and the examples (sketch, pipe)"
+for e in sketch pipe camera; do $CC -O2 -Wall -I. examples/$e.c $B/libwupstream.a -lm $LIBS -o $B/$e; done
+case "$(uname -s)" in MINGW*|MSYS*) ;; *) $CC -O2 -Wall -I. examples/mirror.c $B/libwupstream.a -lm $LIBS -o $B/mirror;; esac
+echo "built $B/libwupstream.a and the examples (sketch, pipe, camera, mirror)"

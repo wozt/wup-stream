@@ -44,7 +44,12 @@ struct wupstream {
     int fresh, took, have_pic, quit, started, sent, repeats;
     struct { uint32_t frame; int len, idr; uint8_t *data; } kept[8];   /* the last frames, to send lost packets again */
     int resent, drop, rumble, rumble_sent, mic, light, light_pad;   /* light: the backlight, 1..6 | keep << 7 (in every hello) */
-    int16_t micbuf[48000]; int mic_w, mic_n;                 /* the last second of the microphone */            /* frames waiting on the pad: this refresh, the last */
+    int16_t micbuf[48000]; int mic_w, mic_n;                 /* the last second of the microphone */
+    /* the camera: the frame being put together from its parts, then up to CAMQ whole ones waiting to be read */
+    #define CAMQ 16
+    int cam, cam_parts, cam_len, cam_r, cam_n, cam_fn, cam_lost;
+    uint32_t cam_frame; uint64_t cam_got;
+    uint8_t cam_asm[65536]; struct { int len; uint8_t d[65536]; } camq[CAMQ];            /* frames waiting on the pad: this refresh, the last */
 };
 
 static void put(wupstream *w, const void *d, int n) { sendto(w->sock, (const char *)d, n, 0, (struct sockaddr *)&w->pad, sizeof w->pad); }
@@ -77,7 +82,7 @@ static void send_packet(wupstream *w, int j, int q) {            /* packet q of 
     put(w, pkt, 16 + n);
 }
 static void pump(wupstream *w) {                               /* what the pad sent; a hello now and then */
-    uint8_t b[1100];
+    uint8_t b[1500];
     struct sockaddr_in from; socklen_t fl = sizeof from;
     int n;
     while ((n = recvfrom(w->sock, (char *)b, sizeof b, 0, (struct sockaddr *)&from, &fl)) > 0) {
@@ -95,6 +100,22 @@ static void pump(wupstream *w) {                               /* what the pad s
             w->micbuf[w->mic_w] = (int16_t)(b[i] | b[i + 1] << 8); w->mic_w = (w->mic_w + 1) % 48000;
             if (w->mic_n < 48000) w->mic_n++;
         }
+        if (b[0] == 'C' && n > 8 && n <= 8 + 1024 && b[3] && b[3] <= 64 && b[2] < b[3]) {   /* the camera: part b[2] of b[3] */
+            uint32_t f; memcpy(&f, b + 4, 4);
+            if (f != w->cam_frame || b[3] != w->cam_parts) {              /* a new frame (the last, if not whole: lost) */
+                if (w->cam_got) w->cam_lost++;
+                w->cam_frame = f; w->cam_parts = b[3]; w->cam_got = 0; w->cam_len = 0;
+            }
+            memcpy(w->cam_asm + 1024 * b[2], b + 8, (size_t)n - 8);
+            w->cam_got |= 1ull << b[2];
+            if (b[2] == b[3] - 1) w->cam_len = 1024 * b[2] + n - 8;
+            if (w->cam_got == (b[3] == 64 ? ~0ull : (1ull << b[3]) - 1) && w->cam_len) {
+                if (w->cam_n == CAMQ) { w->cam_r = (w->cam_r + 1) % CAMQ; w->cam_n--; w->cam_lost++; }   /* (not read: the oldest goes) */
+                int q = (w->cam_r + w->cam_n++) % CAMQ;
+                w->camq[q].len = w->cam_len; memcpy(w->camq[q].d, w->cam_asm, (size_t)w->cam_len);
+                w->cam_got = 0; w->cam_parts = 0;
+            }
+        }
         if (b[0] == 'I' && n == 136) {
             memcpy(w->report, b + 8, 128); w->have = 1; w->last_in = now(); w->light_pad = b[4];
             refresh_seen(w, w->last_in - (b[2] | b[3] << 8) / 997300.0);   /* (ticks since its refresh: ~997.3 kHz) */
@@ -105,7 +126,7 @@ static void pump(wupstream *w) {                               /* what the pad s
         }
     }
     double t = now();
-    if (t - w->last_hello > 0.25) { char h[4] = { 'H', 1, (char)w->mic, (char)w->light }; put(w, h, 4); w->last_hello = t; }
+    if (t - w->last_hello > 0.25) { char h[4] = { 'H', 1, (char)(w->mic | w->cam << 1), (char)w->light }; put(w, h, 4); w->last_hello = t; }
     if (w->have && t - w->last_in > 2 && !w->gone) { w->gone = 1; if (w->started) pthread_cond_broadcast(&w->cv); }     /* the pad stopped answering (or left the stream) */
 }
 
@@ -355,6 +376,45 @@ int wupstream_mic(wupstream *w, int16_t *samples, int max) {
     int n = w->mic_n < max ? w->mic_n : max;
     for (int i = 0; i < n; i++) samples[i] = w->micbuf[(w->mic_w + 48000 - w->mic_n + i) % 48000];
     w->mic_n -= n;
+    pthread_mutex_unlock(&w->mu);
+    return n;
+}
+
+/* The GamePad's encoder sends bare slice data (as its decoder takes it): here each frame becomes an access unit of an
+   ordinary H.264 stream: the parameter sets (640 x 480, Main, CABAC, one reference, constrained intra prediction), a P
+   slice header (QP 32, the deblocking filter on, no offsets), then the data with emulation prevention. These settings
+   are the encoder's own: with them a decoder's picture equals the encoder's reference picture (pulled from the pad's
+   memory and compared, 2026-11-24); with constrained intra prediction or the filter off it decodes without an error
+   but drifts: flat patches, colours washing out. */
+int wupstream_camera(wupstream *w, uint8_t *h264, int max) {
+    static const uint8_t sets[] = { 0, 0, 0, 1, 0x67, 0x4d, 0x00, 0x1f, 0xda, 0x02, 0x80, 0xf6, 0x40, 0, 0, 0, 1, 0x68, 0xee, 0x06, 0x7a };
+    pthread_mutex_lock(&w->mu);
+    if (!w->cam) { w->cam = 1; w->last_hello = 0; }                  /* (asked for with the next hello) */
+    pump(w);
+    int n = 0;
+    while (w->cam_n && !n) {
+        const uint8_t *d = w->camq[w->cam_r].d; int len = w->camq[w->cam_r].len, fn = (w->cam_fn + 1) & 15, z = 0;
+        if (max >= (int)sizeof sets + 1300 + 5 + (len + 3) * 3 / 2) {   /* (room for every byte escaped) */
+            memcpy(h264, sets, sizeof sets); n = sizeof sets;
+            if (!w->cam_fn) {
+                /* The encoder makes no keyframe, and a decoder shows nothing before one: the stream begins with a grey
+                   one made here: a second picture parameter set (CAVLC), and an IDR slice whose 1200 macroblocks are
+                   all "intra 16x16, DC, nothing coded" (8 bits each: 0x27, here shifted by the 22-bit slice header). */
+                static const uint8_t grey[] = { 0, 0, 0, 1, 0x68, 0x53, 0x81, 0x9c, 0x80, 0, 0, 0, 1, 0x65, 0x88, 0x41, 0x28 };
+                memcpy(h264 + n, grey, sizeof grey); n += sizeof grey;
+                memset(h264 + n, 0x9c, 1199); n += 1199; h264[n++] = 0x9e;
+            }
+            h264[n++] = 0; h264[n++] = 0; h264[n++] = 0; h264[n++] = 1; h264[n++] = 0x61;
+            const uint8_t head[3] = { (uint8_t)(0x9a | fn >> 3), (uint8_t)((fn & 7) << 5 | 0x03), 0xff };
+            for (int i = 0; i < 3 + len; i++) {
+                uint8_t c = i < 3 ? head[i] : d[i - 3];
+                if (z >= 2 && c <= 3) { h264[n++] = 3; z = 0; }
+                h264[n++] = c; z = c ? 0 : z + 1;
+            }
+            w->cam_fn++;
+        }
+        w->cam_r = (w->cam_r + 1) % CAMQ; w->cam_n--;                /* (too big for the caller's buffer: dropped) */
+    }
     pthread_mutex_unlock(&w->mu);
     return n;
 }
