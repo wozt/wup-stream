@@ -53,7 +53,50 @@ static void send_peer(const void *d, u32 n) { if (peer_on) send_to(&peer_sa, d, 
 static u32 rbase, rsize, wp, von, need_idr = 1, vlen, vstart, vidr, frames;
 static u32 keys, lost, stalls, gap_max, poll_ms, full, qmax, t_start;   /* (counters, logged every 5 s) */
 static u32 wd_rp, wd_ms, lcd80, shown, lit_at, lit_start, lit_len;
+/* WUP_FLIGHT_0903: no MMIO reads or decoder mutations in the diagnostic thread. */
+#define DIAG_COUNT 64
+static volatile u32 diag_run, diag_active, diag_seq, diag_progress, diag_stage;
+static int diag_sock = -1;
+static struct { u32 seq, stage, a, b; } diag_ring[DIAG_COUNT];
+static void diag_event(u32 stage, u32 a, u32 b) {
+    u32 seq = diag_seq + 1;
+    diag_ring[seq % DIAG_COUNT].seq = 0;
+    __asm__ volatile("" ::: "memory");
+    diag_ring[seq % DIAG_COUNT].stage = stage;
+    diag_ring[seq % DIAG_COUNT].a = a;
+    diag_ring[seq % DIAG_COUNT].b = b;
+    __asm__ volatile("" ::: "memory");
+    diag_ring[seq % DIAG_COUNT].seq = seq;
+    diag_stage = stage;
+    diag_seq = seq;
+    ++diag_progress;
+}
+static void diag_worker(void *arg) {
+    (void)arg;
+    u32 prev = 0, unchanged = 0, serial = 0;
+    struct sockaddr_in to = { .sin_family = AF_INET, .sin_port = htons(28804), .sin_addr.s_addr = 0xffffffffu };
+    static u32 msg[8 + DIAG_COUNT * 4];
+    while (diag_run) {
+        wup_thread_sleep(250);
+        if (!diag_run) break;
+        if (!diag_active) { unchanged = 0; prev = diag_progress; continue; }
+        unsigned irq = wup_irq_off();
+        u32 progress = diag_progress;
+        unchanged = progress == prev ? unchanged + 1 : 0;
+        prev = progress;
+        msg[0] = 0x31444657u; /* WFD1 */
+        msg[1] = ++serial; msg[2] = progress; msg[3] = diag_stage;
+        msg[4] = unchanged; msg[5] = diag_seq;
+        msg[6] = DIAG_COUNT; msg[7] = 0;
+        memcpy(msg + 8, diag_ring, sizeof diag_ring);
+        wup_irq_restore(irq);
+        if (diag_sock >= 0) sendto(diag_sock, msg, sizeof msg, MSG_DONTWAIT,
+                                  (const struct sockaddr *)&to, sizeof to);
+    }
+}
+
 static void stop_engine(void) {
+    diag_event(10, wp, von);
     u32 row = DRV(8), ack = row ? 0x200 : 0x218;
     ENG(0x00) |= 0x20000;
     ENG(0x74) |= row ? 0x200 : 0x21a;
@@ -61,14 +104,17 @@ static void stop_engine(void) {
     ENG(0x74) |= 0x80;
     ENG(0x74) &= row ? ~0x280u : 0xfffffd65u;
     VDEC(0x38) = 0;
+    diag_event(11, wp, von);
 }
 static void start_engine(void) {
+    diag_event(12, wp, vlen);
     VDEC(0x0c) = 2 | (DRV(0xc) ? 1 : 0);
     ENG(0x70) &= ~(DRV(8) ? 0xb000u : 0xa000u);
     VDEC(0x30) |= 0x00ff0000; VDEC(0x30) &= ~0x00030000u;
     if (!(LCD(0x84) & 4)) { ENG(0x20) = 0; RST844 |= 0x00300000; RST844 &= ~0x00300000u; }
     RST844 |= 0x30000000; RST844 &= ~0x30000000u;
     ENG(0x00) |= 0x10000;
+    diag_event(13, wp, vlen);
 }
 static u32 ring_free(void) {
     if (!von) return rsize - 16;
@@ -121,6 +167,7 @@ static void video(const u8 *d16, u32 len, const u8 *h, u32 now) {      /* d16: t
     u32 fno = *(u32 *)(h + 4), off = *(u32 *)(h + 8), total = *(u32 *)(h + 12), n = len - 16u, idr = h[1] & 1;
     if (idr && (!sync || fno != next_f || !as[0].idr)) {       /* a keyframe: the decoder starts again with it, at the ring's start */
         if (sync && (int)(fno - next_f) < 0) return;           /* (an old one, again) */
+        diag_event(20, fno, wp);
         as_reset(fno); wp = 0; as[0].idr = 1; as[0].t_head = now;
     }
     if (!sync || (need_idr && !as[0].idr)) return;             /* waiting for a keyframe */
@@ -140,15 +187,19 @@ static void video(const u8 *d16, u32 len, const u8 *h, u32 now) {      /* d16: t
     if (off % 1400 || k >= as[d].npk || off + n > as[d].len || (n != 1400 && off + n != as[d].len)) return;
     if (!(as[d].got[k / 32] >> (k % 32) & 1)) {
         u32 at = (start + off) % rsize, first = n < rsize - at ? n : rsize - at;
+        diag_stage = 21;
         memcpy((u8 *)(rbase + at), d16, first); cache_clean((u8 *)(rbase + at), first);
         if (n > first) { memcpy((u8 *)rbase, d16 + first, n - first); cache_clean((u8 *)rbase, n - first); }
+        diag_stage = 22;
         as[d].got[k / 32] |= 1u << (k % 32); as[d].have++;
     }
     as[d].t_rx = now;
     if (d > 0 && as[d - 1].have != as[d - 1].npk) nack(now);   /* a later frame has begun: what the earlier lacks is lost */
     while (as[0].known && as[0].have == as[0].npk) {           /* whole frames, in order, to the decoder */
         vstart = wp; vlen = as[0].len; vidr = as[0].idr;
-        frame_done();                                          /* (moves wp past it) */
+        diag_event(30, next_f, vlen);
+        frame_done();
+        diag_stage = 31;                                          /* (moves wp past it) */
         if (!vidr && !von) { sync = 0; return; }
         for (int i = 0; i < NASM - 1; i++) as[i] = as[i + 1];
         memset(&as[NASM - 1], 0, sizeof as[0]);
@@ -158,6 +209,7 @@ static void video(const u8 *d16, u32 len, const u8 *h, u32 now) {      /* d16: t
 /* The decoder stops for good when a screen refresh comes and it has nothing queued: its read position still, frames
    waiting in its queue. Only a keyframe restarts it (Nintendo's driver too: LVC 0x18138). Idle after 60 ms. */
 static void watchdog(u32 now) {
+    diag_stage = 50;
     feed();
     u32 rp = VDEC(0x2c) & 0xffffff, at = rp - rbase, q = (wp + rsize - at) % rsize;
     if (q < rsize - 4096 && q >> 10 > qmax) qmax = q >> 10;
@@ -190,7 +242,9 @@ static void nack(u32 now) {
 /* ---- sound: libwup's speaker ring, at most 128 ms queued */
 static void audio(const u8 *d8, u32 len) {
     u32 n = (len - 8u) & ~15u;
+    diag_stage = 51;
     if (n && wup_audio_queued() < 48000 * 128 / 1000) wup_audio_queue((const int16_t *)d8, (int)(n / 4));
+    diag_stage = 52;
 }
 /* ---- the motor: on while the computer keeps saying so (with every frame), off 100 ms after the last "on" */
 static u32 motor_ms, motor_on;
@@ -261,6 +315,7 @@ static void draw_waiting(void) {
     gfx_present_all();
 }
 static void end_session(void) {
+    diag_event(40, wp, von);
     if (von) stop_engine();
     VDEC(0x0c) = 0;
     if (shown) { gfx_brightness(0); draw_waiting(); LCD(0x80) = lcd80; }   /* (our screen was the decoder's: draw it again, dark) */
@@ -271,6 +326,8 @@ static void end_session(void) {
     peer_on = von = sync = npend = 0; need_idr = 1; wp = 0;
     if (shown) gfx_fade(0, 256);
     shown = 0;
+    diag_event(41, 0, 0);
+    diag_active = 0;
     wup_log("wupstream: stream ended");
 }
 static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now) {
@@ -281,6 +338,8 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
     if (!peer_on && h[0] == 'H') {
         peer_sa = *from; peer_on = 1; need_idr = 1; frames = keys = lost = resent = stalls = full = gap_max = qmax = 0; stat_ms = t_start = now;
         rbase = VDEC(0x24) & 0xffffff; rsize = (VDEC(0x28) & 0xffffff) - rbase; wp = 0;
+        diag_active = 1;
+        diag_event(42, rbase, rsize);
         wup_log("wupstream: stream started");
     }
     if (!peer_on || from->sin_addr.s_addr != peer_sa.sin_addr.s_addr || from->sin_port != peer_sa.sin_port) return;
@@ -348,21 +407,36 @@ int main(void) {
         if (sock < 0 || bind(sock, (struct sockaddr *)&me, sizeof me)) net_ok = 0;
     }
     wup_audio_open();
+    int diag_thread = -1;
+    if (net_ok) {
+        int one = 1;
+        diag_sock = socket(AF_INET, SOCK_DGRAM, 0);
+        if (diag_sock >= 0 && !setsockopt(diag_sock, SOL_SOCKET, SO_BROADCAST, &one, sizeof one)) {
+            diag_run = 1;
+            diag_thread = wup_thread_start(diag_worker, NULL, 2048, 1);
+        }
+    }
     draw_waiting();
     unsigned held = wup_buttons();
     u32 quit_combo_since = 0;
     int quit_combo_active = 0;
     static u8 buf[1536] __attribute__((aligned(4)));
     for (;;) {
+        ++diag_progress;
+        diag_stage = 1;
         wup_sleep(peer_on ? 1 : 16);                         /* (the firmware's tasks run in here; the network in its own threads) */
         u32 now = clock_ms();
         if (net_ok) {
             for (;;) {
                 struct sockaddr_in from; socklen_t fl = sizeof from;
+                diag_stage = 2;
                 int n = (int)recvfrom(sock, buf, sizeof buf, MSG_DONTWAIT, (struct sockaddr *)&from, &fl);
                 if (n <= 0) break;
+                ++diag_progress;
+                diag_stage = 3;
                 packet(buf, (u32)n, &from, clock_ms());
             }
+            diag_stage = 4;
             tick(clock_ms());
         }
         unsigned b = wup_buttons(), pressed = b & ~held;
@@ -392,5 +466,7 @@ int main(void) {
         }
     }
     if (peer_on) end_session();
+    diag_run = 0;
+    if (diag_thread >= 0 && wup_thread_join(diag_thread, 1000)) wup_thread_kill(diag_thread);
     return 0;
 }
