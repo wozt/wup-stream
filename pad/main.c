@@ -222,15 +222,11 @@ static int level_now(void) {
 }
 static void apply_light(void) {
     int percent = light_off ? 0 : hw_backlight_percent(level_now());
-    char msg[] = "wupstream: backlight apply level=0";
-    msg[sizeof msg - 2] = (char)('0' + (light_off ? 0 : level_now()));
-    wup_log(msg);
     wup_backlight(percent);
 }
 static void light(u32 v) {
     if (v == light_now) return; /* repeated keepalive is not a new choice */
     light_now = v;
-    wup_log("wupstream: changed remote backlight command");
     if (v & 0x40) { light_off = 1; light_override = 1; apply_light(); return; }
     int level = (int)(v & 7);
     if (level >= 1 && level <= 6) {
@@ -244,7 +240,6 @@ static void local_light_step(int delta) {
     if (level < 1) level = 1;
     if (level > 6) level = 6;
     light_level = level; light_off = 0; light_override = 1;
-    wup_log("wupstream: local brightness shortcut");
     apply_light();
 }
 /* No periodic backlight writes: only explicit commands and session exit. */
@@ -271,10 +266,7 @@ static void end_session(void) {
     if (shown) { gfx_brightness(0); draw_waiting(); LCD(0x80) = lcd80; }   /* (our screen was the decoder's: draw it again, dark) */
     motor(0, 0); mic(0);
     light_now = 0;
-    if (light_override) {
-        wup_log("wupstream: backlight restore menu on session end");
-        wup_backlight(wup_backlight_level());
-    }
+    if (light_override) wup_backlight(wup_backlight_level());
     light_off = 0; light_level = 0; light_override = 0;
     peer_on = von = sync = npend = 0; need_idr = 1; wp = 0;
     if (shown) gfx_fade(0, 256);
