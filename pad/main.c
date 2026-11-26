@@ -14,24 +14,20 @@
  *   pad -> PC    'N' count 0 0, then count x {u32 frame, u16 packet (0xffff: all of it), u16 0}: send these again
  *   pad -> PC    'I' flags(1 = send a keyframe; bits 1-3: frames waiting for the decoder), u16 clock ticks (~1 us)
  *                since the screen's last refresh, u8 backlight (1..6, 0 = off), 0 0 0, the 128-byte input report
- * Video is the frame's raw CABAC slice data: it goes straight into the hardware decoder's bitstream ring.
- * The app's own screen (RGB565 at 0x221400) is the decoder's frame buffers: it is never shown while video plays,
- * and drawn again from scratch when a stream ends. */
+ * Video is each frame's raw CABAC slice data, put together here from its packets and handed whole to the hardware
+ * decoder (libwup's wup_video_*: the kernel's driver). While video plays the screen's memory is the decoder's: the
+ * waiting screen is drawn again from scratch when a stream ends. */
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "wup.h"
-#include "armcpu.h"
 #include "wup_hw.h"                                   /* (hw_backlight_percent: the table's levels) */
 
 WUP_APP("wupstream");
 typedef uint8_t u8; typedef uint16_t u16; typedef uint32_t u32;
-#define REG(a)  (*(volatile u32 *)(a))
-#define LCD(o)  REG(0xf0009400u + (o))
-#define CLOCK   REG(0xf0000408u)                              /* free-running, ~997.3 kHz */
-#define REPORT  ((const volatile u8 *)0x00178d38u)            /* the latest 128-byte input report */
+#define CLOCK   (*(volatile u32 *)0xf0000408u)                /* free-running, ~997.3 kHz */
 
 static u32 ms_, last_clk, frac;
 static u32 clock_ms(void) { u32 c = CLOCK; frac += c - last_clk; last_clk = c; ms_ += frac / 997; frac %= 997; return ms_; }
@@ -44,128 +40,67 @@ static u16 in_seq;
 static void send_to(const struct sockaddr_in *to, const void *d, u32 n) { sendto(sock, d, n, 0, (const struct sockaddr *)to, sizeof *to); }
 static void send_peer(const void *d, u32 n) { if (peer_on) send_to(&peer_sa, d, n); }
 
-/* ---- video: the hardware decoder. Every keyframe restarts it (the firmware's stream-start sequence: LVC 0x17a10 stop,
-   ring restart, 0x17ee0 start): with no slice headers it cannot tell a keyframe otherwise. */
-#define VDEC(o) REG(0xf0008480u + (o))
-#define ENG(o)  REG(0xf0008c00u + (o))
-#define RST844  REG(0xf0000844u)
-#define DRV(o)  REG(0x000bb2f0u + (o))                       /* drvvout state: +8 row mode, +0xc force decoding */
-static u32 rbase, rsize, wp, von, need_idr = 1, vlen, vstart, vidr, frames;
-static u32 keys, lost, stalls, gap_max, poll_ms, full, qmax, t_start;   /* (counters, logged every 5 s) */
-static u32 wd_rp, wd_ms, lcd80, shown, lit_at, lit_start, lit_len;
-static void stop_engine(void) {
-    u32 row = DRV(8), ack = row ? 0x200 : 0x218;
-    ENG(0x00) |= 0x20000;
-    ENG(0x74) |= row ? 0x200 : 0x21a;
-    for (int i = 0; i < 200 && (ENG(0x74) & ack) != ack; i++) wup_thread_sleep(1);
-    ENG(0x74) |= 0x80;
-    ENG(0x74) &= row ? ~0x280u : 0xfffffd65u;
-    VDEC(0x38) = 0;
+/* ---- video: whole frames to the hardware decoder (wup_video_frame). Every keyframe restarts it; after a lost or late
+   frame only a keyframe goes on (wup_video_need_key); the kernel watches it for stalls. The screen stays dark until
+   the decoder has taken 3 frames (no stale picture shown), then lights up. */
+static u32 von, need_idr = 1, frames, shown, lit_at, lit_ms;
+static u32 keys, lost, stalls, gap_max, poll_ms, full, t_start;   /* (counters, logged every 5 s) */
+static int frame_done(const u8 *data, u32 len, int idr, u32 now) {   /* 0, or < 0: dropped */
+    if (!idr && (need_idr || wup_video_need_key())) { need_idr = 1; return -1; }
+    if (!shown) { gfx_brightness(0); if (wup_video_open()) return -1; shown = 1; lit_at = 0; }
+    if (wup_video_frame(data, len, idr)) { need_idr = 1; if (von) stalls++; von = 0; return -1; }
+    von = 1; need_idr = 0; frames++; if (idr) keys++;
+    if (shown == 1 && ++lit_at == 3) { shown = 2; lit_ms = now; }
+    return 0;
 }
-static void start_engine(void) {
-    VDEC(0x0c) = 2 | (DRV(0xc) ? 1 : 0);
-    ENG(0x70) &= ~(DRV(8) ? 0xb000u : 0xa000u);
-    VDEC(0x30) |= 0x00ff0000; VDEC(0x30) &= ~0x00030000u;
-    if (!(LCD(0x84) & 4)) { ENG(0x20) = 0; RST844 |= 0x00300000; RST844 &= ~0x00300000u; }
-    RST844 |= 0x30000000; RST844 &= ~0x30000000u;
-    ENG(0x00) |= 0x10000;
-}
-static u32 ring_free(void) {
-    if (!von) return rsize - 16;
-    u32 rp = (VDEC(0x2c) & 0xffffff) - rbase;
-    /* the decoder reads a little past the queued end: a read pointer just ahead of us means empty, not full */
-    if ((rp + rsize - wp) % rsize < 4096) return rsize - 4096;
-    u32 used = (wp + rsize - rp) % rsize;
-    return used + 4096 < rsize ? rsize - used - 4096 : 0;
-}
-/* The decoder's own queue holds 4 frames (VDEC +0x34 low bits; Nintendo's driver feeds it only below that, LVC 0x18996)
-   and it starts at most one frame per screen refresh (measured). What does not fit waits here; the count of all frames
-   waiting goes to the computer with every input packet, and it skips a refresh when that reaches 2. */
-static u32 pend[8], npend;
-static void feed(void) {
-    while (npend && (VDEC(0x34) & 7) < 4) { VDEC(0x00) = pend[0]; npend--; for (u32 i = 0; i < npend; i++) pend[i] = pend[i + 1]; }
-}
-static u32 waiting(void) { u32 n = (VDEC(0x34) & 7) + npend; return n > 7 ? 7 : n; }
-static void frame_done(void) {
-    if (!vidr && !von) { need_idr = 1; return; }     /* (stopped: only a keyframe starts it; this one is dropped) */
-    u32 end = rbase + (vstart + vlen) % rsize;
-    if (vidr) {
-        stop_engine();
-        VDEC(0x0c) = 0;
-        u32 b = VDEC(0x24);
-        VDEC(0x24) = 0; VDEC(0x24) = (rbase + vstart) & 0xffffff; VDEC(0x24) = b;
-        VDEC(0x00) = (end & 0xffffff) | 1u << 24;
-        start_engine();
-        von = 1; keys++; npend = 0;
-        if (shown == 2) shown = 1;                        /* (not lit yet: count 3 again from here) */
-        if (shown == 1) lit_at = 0;
-    } else if (npend == 8) { von = 0; need_idr = 1; stalls++; return; }   /* (it is not taking them: start again) */
-    else { pend[npend++] = (end & 0xffffff) | 1u << 24; feed(); }
-    wp = (vstart + vlen) % rsize; need_idr = 0; frames++;
-    if (!shown) {             /* the video layer, dark until the decoder has read 3 frames (no stale picture, no hang shown) */
-        lcd80 = LCD(0x80); gfx_brightness(0); LCD(0x80) = (lcd80 | 4) & ~0x10u;
-        shown = 1; lit_at = 0;
-    }
-    if (shown == 1 && ++lit_at == 3) { lit_start = vstart; lit_len = vlen; shown = 2; }   /* (light when it is read) */
-}
+static u32 waiting(void) { return von ? (u32)wup_video_waiting() : 0; }
+
 /* Frames come in packets of 1400 bytes, and Wi-Fi loses some. The frames waiting for the decoder (the cushion) give the
    time to get a lost packet again: up to 4 frames are put together at once, each at its place in the ring, and go to
    the decoder in order as they become whole. What is missing is asked for again ('N'): when later packets show the
    gap, or nothing came for 6 ms. A frame still not whole after 45 ms is given up: a keyframe then. */
 #define NASM 4
-static struct { u32 len, npk, have, got[4], t_rx, t_nack, t_head; u8 known, idr; } as[NASM];
+#define FRAME_MAX (128 * 1400u)                               /* (a frame of up to 128 packets) */
+static struct { u32 len, npk, have, got[4], t_rx, t_nack, t_head; u8 known, idr; u8 *data; } as[NASM];
 static u32 next_f, seen_f, sync, resent;
 static void nack(u32 now);
-static void as_reset(u32 f) { memset(as, 0, sizeof as); next_f = seen_f = f; sync = 1; }
+static void as_clear(int i) { u8 *d = as[i].data; memset(&as[i], 0, sizeof as[i]); as[i].data = d; }
+static void as_reset(u32 f) { for (int i = 0; i < NASM; i++) as_clear(i); next_f = seen_f = f; sync = 1; }
 static void video(const u8 *d16, u32 len, const u8 *h, u32 now) {      /* d16: the data after the 16-byte header */
     u32 fno = *(u32 *)(h + 4), off = *(u32 *)(h + 8), total = *(u32 *)(h + 12), n = len - 16u, idr = h[1] & 1;
     if (idr && (!sync || fno != next_f || !as[0].idr)) {       /* a keyframe: the decoder starts again with it, at the ring's start */
         if (sync && (int)(fno - next_f) < 0) return;           /* (an old one, again) */
-        as_reset(fno); wp = 0; as[0].idr = 1; as[0].t_head = now;
+        as_reset(fno); as[0].idr = 1; as[0].t_head = now;
     }
     if (!sync || (need_idr && !as[0].idr)) return;             /* waiting for a keyframe */
     int d = (int)(fno - next_f);
     if (d < 0) return;                                         /* (already whole: a packet sent twice) */
     if (d >= NASM) { lost++; need_idr = 1; sync = 0; return; } /* too far ahead: we lost the thread */
     if ((int)(fno - seen_f) > 0) seen_f = fno;
-    u32 start = wp;
-    for (int i = 0; i < d; i++) { if (!as[i].known) { nack(now); return; } start += as[i].len; }   /* (its place is not known yet) */
     if (!as[d].known) {
-        if (!total || total > rsize - 4096 || (!as[0].idr && start - wp + total > ring_free())) { full++; need_idr = 1; sync = 0; return; }
+        if (!total || total > FRAME_MAX) { full++; need_idr = 1; sync = 0; return; }
         as[d].known = 1; as[d].len = total; as[d].npk = (total + 1399) / 1400; as[d].have = 0; as[d].idr = (u8)idr;
         memset(as[d].got, 0, sizeof as[d].got);
-        if (as[d].npk > 128) { need_idr = 1; sync = 0; return; }
     }
     u32 k = off / 1400;
     if (off % 1400 || k >= as[d].npk || off + n > as[d].len || (n != 1400 && off + n != as[d].len)) return;
     if (!(as[d].got[k / 32] >> (k % 32) & 1)) {
-        u32 at = (start + off) % rsize, first = n < rsize - at ? n : rsize - at;
-        memcpy((u8 *)(rbase + at), d16, first); cache_clean((u8 *)(rbase + at), first);
-        if (n > first) { memcpy((u8 *)rbase, d16 + first, n - first); cache_clean((u8 *)rbase, n - first); }
+        memcpy(as[d].data + off, d16, n);
         as[d].got[k / 32] |= 1u << (k % 32); as[d].have++;
     }
     as[d].t_rx = now;
     if (d > 0 && as[d - 1].have != as[d - 1].npk) nack(now);   /* a later frame has begun: what the earlier lacks is lost */
     while (as[0].known && as[0].have == as[0].npk) {           /* whole frames, in order, to the decoder */
-        vstart = wp; vlen = as[0].len; vidr = as[0].idr;
-        frame_done();                                          /* (moves wp past it) */
-        if (!vidr && !von) { sync = 0; return; }
+        if (frame_done(as[0].data, as[0].len, as[0].idr, now) && !as[0].idr) { sync = 0; return; }
+        u8 *d0 = as[0].data;
         for (int i = 0; i < NASM - 1; i++) as[i] = as[i + 1];
-        memset(&as[NASM - 1], 0, sizeof as[0]);
+        as[NASM - 1].data = d0; as_clear(NASM - 1);
         next_f++; as[0].t_head = now;
     }
 }
-/* The decoder stops for good when a screen refresh comes and it has nothing queued: its read position still, frames
-   waiting in its queue. Only a keyframe restarts it (Nintendo's driver too: LVC 0x18138). Idle after 60 ms. */
+/* the screen lit once the decoder has had its first 3 frames a moment (its stalls: the kernel's) */
 static void watchdog(u32 now) {
-    feed();
-    u32 rp = VDEC(0x2c) & 0xffffff, at = rp - rbase, q = (wp + rsize - at) % rsize;
-    if (q < rsize - 4096 && q >> 10 > qmax) qmax = q >> 10;
-    if (shown == 2 && (at - lit_start + rsize) % rsize >= lit_len && (at - lit_start + rsize) % rsize < lit_len + 0x8000) { gfx_brightness(256); shown = 3; }
-    static u32 wd_n;
-    u32 n = VDEC(0x34) & 7;                                 /* (tiny frames barely move the read position: the count does) */
-    if (!von || rp != wd_rp || n != wd_n || !n) { wd_rp = rp; wd_n = n; wd_ms = now; return; }
-    if (now - wd_ms > 60) { von = 0; need_idr = 1; wd_ms = now; stalls++; }
+    if (shown == 2 && now - lit_ms > 50) { gfx_brightness(256); shown = 3; }
 }
 /* ask for what is missing of the frames being put together: 'N' count 0 0, then per packet u32 frame, u16 index
    (0xffff: the whole frame: none of it came), u16 0. A frame at most every 8 ms. */
@@ -242,13 +177,11 @@ static void draw_waiting(void) {
     gfx_present_all();
 }
 static void end_session(void) {
-    if (von) stop_engine();
-    VDEC(0x0c) = 0;
-    if (shown) { gfx_brightness(0); draw_waiting(); LCD(0x80) = lcd80; }   /* (our screen was the decoder's: draw it again, dark) */
+    if (shown) { gfx_brightness(0); wup_video_close(); draw_waiting(); }   /* (the screen was the decoder's: drawn again, dark) */
     motor(0, 0); mic(0);
     if (light_off) light_off = 0;
     if (light_now) { light_now = 0; wup_backlight(wup_backlight_level()); }
-    peer_on = von = sync = npend = 0; need_idr = 1; wp = 0;
+    peer_on = von = sync = 0; need_idr = 1;
     if (shown) gfx_fade(0, 256);
     shown = 0;
     wup_log("wupstream: stream ended");
@@ -259,8 +192,7 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
     memcpy(h, d, n);
     if (n < 4 || (int)(now - quiet_until) < 0) return;
     if (!peer_on && h[0] == 'H') {
-        peer_sa = *from; peer_on = 1; need_idr = 1; frames = keys = lost = resent = stalls = full = gap_max = qmax = 0; stat_ms = t_start = now;
-        rbase = VDEC(0x24) & 0xffffff; rsize = (VDEC(0x28) & 0xffffff) - rbase; wp = 0;
+        peer_sa = *from; peer_on = 1; need_idr = 1; frames = keys = lost = resent = stalls = full = gap_max = 0; stat_ms = t_start = now;
         wup_log("wupstream: stream started");
     }
     if (!peer_on || from->sin_addr.s_addr != peer_sa.sin_addr.s_addr || from->sin_port != peer_sa.sin_port) return;
@@ -291,29 +223,31 @@ static void tick(u32 now) {                               /* every 1-2 ms */
     if (motor_on && now - motor_ms > 100) motor(0, now);
     if (mic_on) mic_poll();
     if (now - stat_ms >= 5000) {                             /* every 5 s: what the stream did (tools/padlog.py) */
-        static const char *const name[] = { "frames ", " keyframes ", " lost ", " resent ", " stalls ", " full ", " gap-ms ", " queue-kb " };
-        u32 v[] = { frames, keys, lost, resent, stalls, full, gap_max, qmax };
+        static const char *const name[] = { "frames ", " keyframes ", " lost ", " resent ", " stalls ", " full ", " gap-ms " };
+        u32 v[] = { frames, keys, lost, resent, stalls, full, gap_max };
         char l[200], *e = l;
-        for (int i = 0; i < 8; i++) {
+        for (int i = 0; i < 7; i++) {
             for (const char *q = name[i]; *q; q++) *e++ = *q;
             char t[12]; int k = 0; u32 x = v[i];
             do t[k++] = (char)('0' + x % 10); while (x /= 10);
             while (k) *e++ = t[--k];
         }
-        *e = 0; wup_log(l); stat_ms = now; gap_max = qmax = 0;
+        *e = 0; wup_log(l); stat_ms = now; gap_max = 0;
     }
-    u16 seq = (u16)(REPORT[0] | REPORT[1] << 8);
+    const volatile u8 *report = wup_input_report();
+    u16 seq = (u16)(report[0] | report[1] << 8);
     if (seq != in_seq || now - in_ms > 50) {
-        u8 m[8 + 128] = { 'I', (u8)(need_idr | (von ? waiting() << 1 : 0)) };
-        u32 since = CLOCK - LCD(0xfc);                       /* ticks since the screen's last refresh (it latches the clock) */
+        u8 m[8 + 128] = { 'I', (u8)(need_idr | waiting() << 1) };
+        u32 since = wup_us_since_vblank();                   /* since the screen's last refresh (the computer times frames to it) */
         m[2] = (u8)since; m[3] = (u8)(since >> 8); m[4] = (u8)(light_off ? 0 : level_now());
-        for (int i = 0; i < 128; i++) m[8 + i] = REPORT[i];
+        for (int i = 0; i < 128; i++) m[8 + i] = report[i];
         send_peer(m, sizeof m); in_seq = seq; in_ms = now;
     }
 }
 
 int main(void) {
     last_clk = CLOCK;
+    for (int i = 0; i < NASM; i++) if (!(as[i].data = malloc(FRAME_MAX))) return 1;   /* (frames put together: 700 KB) */
     net_ok = wup_net_init() == 0;
     if (net_ok) {
         sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -327,7 +261,7 @@ int main(void) {
     unsigned held = wup_buttons();
     static u8 buf[1536] __attribute__((aligned(4)));
     for (;;) {
-        wup_sleep(peer_on ? 1 : 16);                         /* (the firmware's tasks run in here; the network in its own threads) */
+        wup_sleep(peer_on ? 1 : 16);                         /* (the network runs in its own threads) */
         u32 now = clock_ms();
         if (net_ok) {
             for (;;) {
