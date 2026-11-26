@@ -211,19 +211,43 @@ static void mic_poll(void) {
 }
 /* ---- the backlight: the computer's level while it streams (1..6: the pad's own table, as wupstream counts them; libwup
    takes a percentage), off and on. Told back to the computer as a level (1..6), the menu's own taken to the nearest. */
+/* Last remote command is separate from the locally selected level. */
 static u32 light_now, light_off;
+static int light_level, light_override;
 static int level_now(void) {
-    if (light_now & 7) return (int)(light_now & 7) > 6 ? 6 : (int)(light_now & 7);
+    if (light_level) return light_level;
     int p = wup_backlight_level(), best = 1;
     for (int l = 2; l <= 6; l++) if (abs(hw_backlight_percent(l) - p) < abs(hw_backlight_percent(best) - p)) best = l;
     return best;
 }
-static void light(u32 v) {                                /* (from every hello) */
-    if (v == light_now) return;
-    light_now = v;
-    if (v & 0x40) { if (!light_off) wup_backlight(0); light_off = 1; return; }
-    light_off = 0; wup_backlight(light_now & 7 ? hw_backlight_percent(level_now()) : wup_backlight_level());
+static void apply_light(void) {
+    int percent = light_off ? 0 : hw_backlight_percent(level_now());
+    char msg[] = "wupstream: backlight apply level=0";
+    msg[sizeof msg - 2] = (char)('0' + (light_off ? 0 : level_now()));
+    wup_log(msg);
+    wup_backlight(percent);
 }
+static void light(u32 v) {
+    if (v == light_now) return; /* repeated keepalive is not a new choice */
+    light_now = v;
+    wup_log("wupstream: changed remote backlight command");
+    if (v & 0x40) { light_off = 1; light_override = 1; apply_light(); return; }
+    int level = (int)(v & 7);
+    if (level >= 1 && level <= 6) {
+        light_level = level; light_off = 0; light_override = 1; apply_light();
+    } else if (v == 0) {
+        /* No remote override: retain any local selection. */
+    }
+}
+static void local_light_step(int delta) {
+    int level = level_now() + delta;
+    if (level < 1) level = 1;
+    if (level > 6) level = 6;
+    light_level = level; light_off = 0; light_override = 1;
+    wup_log("wupstream: local brightness shortcut");
+    apply_light();
+}
+/* No periodic backlight writes: only explicit commands and session exit. */
 
 /* ---- the screen while no computer streams */
 static int net_ok;
@@ -246,8 +270,12 @@ static void end_session(void) {
     VDEC(0x0c) = 0;
     if (shown) { gfx_brightness(0); draw_waiting(); LCD(0x80) = lcd80; }   /* (our screen was the decoder's: draw it again, dark) */
     motor(0, 0); mic(0);
-    if (light_off) light_off = 0;
-    if (light_now) { light_now = 0; wup_backlight(wup_backlight_level()); }
+    light_now = 0;
+    if (light_override) {
+        wup_log("wupstream: backlight restore menu on session end");
+        wup_backlight(wup_backlight_level());
+    }
+    light_off = 0; light_level = 0; light_override = 0;
     peer_on = von = sync = npend = 0; need_idr = 1; wp = 0;
     if (shown) gfx_fade(0, 256);
     shown = 0;
@@ -308,6 +336,11 @@ static void tick(u32 now) {                               /* every 1-2 ms */
         u32 since = CLOCK - LCD(0xfc);                       /* ticks since the screen's last refresh (it latches the clock) */
         m[2] = (u8)since; m[3] = (u8)(since >> 8); m[4] = (u8)(light_off ? 0 : level_now());
         for (int i = 0; i < 128; i++) m[8 + i] = REPORT[i];
+        unsigned buttons = ((unsigned)m[10] << 8) | m[11];
+        if ((buttons & WUP_HOME) && (buttons & (WUP_UP | WUP_DOWN))) {
+            buttons &= ~(WUP_HOME | WUP_UP | WUP_DOWN);
+            m[10] = (u8)(buttons >> 8); m[11] = (u8)buttons;
+        }
         send_peer(m, sizeof m); in_seq = seq; in_ms = now;
     }
 }
@@ -340,7 +373,16 @@ int main(void) {
             }
             tick(clock_ms());
         }
-        unsigned b = wup_buttons(), pressed = b & ~held; held = b;
+        unsigned b = wup_buttons(), pressed = b & ~held;
+        unsigned up_combo = WUP_HOME | WUP_UP, down_combo = WUP_HOME | WUP_DOWN;
+        if (!(b & WUP_B)) {
+            if ((b & up_combo) == up_combo && (held & up_combo) != up_combo && !(b & WUP_DOWN))
+                local_light_step(1);
+            if ((b & down_combo) == down_combo && (held & down_combo) != down_combo && !(b & WUP_UP))
+                local_light_step(-1);
+        }
+        held = b;
+        /* Backlight changes are event driven. */
         if (!peer_on && (pressed & WUP_B)) break;  /* B alone: only while waiting */
         /* Local emergency exit: HOME + B continuously for 2 seconds.
            Never intercept either key alone; reset timer when either is released.
