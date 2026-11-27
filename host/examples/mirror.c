@@ -4,7 +4,7 @@
  * too; with "echo" what it hears also comes back from the pad's speakers 1.5 seconds later: everything the pad can
  * send, while it shows video and plays sound.
  *   build/host/mirror [pad IP] [mic | echo]
- * Stream (wup-os) must be open on the GamePad; HOME ends it.
+ * WUP Stream must be open on the GamePad; HOME ends it.
  * (macOS and Linux) */
 #include <pthread.h>
 #include <signal.h>

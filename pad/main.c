@@ -4,13 +4,17 @@
  *
  * Protocol (UDP, little endian). The pad listens on port 50000.
  *   pad -> broadcast:50001  'B' version 0 0                      every second while no computer is connected
- *   PC  -> pad   'H' version flags(1 = send the microphone) light  hello / keepalive (every 250 ms); light: the
+ *   PC  -> pad   'H' version flags(1 = the microphone, 2 = the camera) light  hello / keepalive (every 250 ms); light: the
  *                                                                 backlight 1..6 (0 = leave it), bit 6 = off, bit 7 = keep it
  *                'V' flags(1 = keyframe) 0 0, u32 frame, u32 offset, u32 total, then <= 1400 bytes
  *                'A' 0 0 0, u32 seq, then 48 kHz 16-bit stereo PCM (a multiple of 16 bytes)
  *                'R' on(1)/off(0)                                 the rumble motor (said again with every frame while on)
  *                'Q'                                             the computer is done
+ *                'K'                                             the camera's encoder again (a frame was lost)
  *   pad -> PC    'M' 0 0 0, u32 sample number, then the microphone: 16-bit mono 48 kHz
+ *   pad -> PC    'C' run part parts, u32 frame, then <= 1024 bytes: the camera, encoded (640 x 480 H.264 slice data); run
+ *                counts the encoder's starts, frame is the number within the run (0: a keyframe; every frame the
+ *                encoder made is counted, sent or not: a gap is a lost frame, and only a new run repairs it)
  *   pad -> PC    'N' count 0 0, then count x {u32 frame, u16 packet (0xffff: all of it), u16 0}: send these again
  *   pad -> PC    'I' flags(1 = send a keyframe; bits 1-3: frames waiting for the decoder), u16 clock ticks (~1 us)
  *                since the screen's last refresh, u8 backlight (1..6, 0 = off), 0 0 0, the 128-byte input report
@@ -39,6 +43,9 @@ static u32 peer_on, last_ms, quiet_until, beacon_ms, in_ms, stat_ms;
 static u16 in_seq;
 static void send_to(const struct sockaddr_in *to, const void *d, u32 n) { sendto(sock, d, n, 0, (const struct sockaddr *)to, sizeof *to); }
 static void send_peer(const void *d, u32 n) { if (peer_on) send_to(&peer_sa, d, n); }
+static int send_peer_ok(const void *d, u32 n) {           /* 0, or < 0: not taken now (no room): try again later */
+    return peer_on && sendto(sock, d, n, MSG_DONTWAIT, (const struct sockaddr *)&peer_sa, sizeof peer_sa) == (int)n ? 0 : -1;
+}
 
 /* ---- video: whole frames to the hardware decoder (wup_video_frame). Every keyframe restarts it; after a lost or late
    frame only a keyframe goes on (wup_video_need_key); the kernel watches it for stalls. The screen stays dark until
@@ -135,15 +142,61 @@ static void motor(int on, u32 now) {
 /* ---- the microphone */
 static u32 mic_on, mic_seq;
 static void mic(int on) { if (on == (int)mic_on) return; if (on) wup_mic_open(); else wup_mic_close(); mic_on = (u32)on; }
-static void mic_poll(void) {
+static void mic_poll(u32 now) {                      /* in packets of 512 samples (or what came in 15 ms): read as it
+                                                         comes, a few samples a time, it was ~1000 small packets a second,
+                                                         which with the camera's brought the radio down (2026-11-26) */
     static u8 m[8 + 1024] __attribute__((aligned(4))) = { 'M' };
-    for (;;) {
-        int n = wup_mic_read((int16_t *)(m + 8), 512);
-        if (n <= 0) return;
-        memcpy(m + 4, &mic_seq, 4); mic_seq += (u32)n;
-        send_peer(m, 8 + 2 * (u32)n);
+    static u32 have, first_ms;
+    while (have < 512) {
+        int n = wup_mic_read((int16_t *)(m + 8) + have, (int)(512 - have));
+        if (n <= 0) break;
+        if (!have) first_ms = now;
+        have += (u32)n;
+    }
+    if (have == 512 || (have && now - first_ms >= 15)) {
+        memcpy(m + 4, &mic_seq, 4); mic_seq += have;
+        send_peer(m, 8 + 2 * have);
+        have = 0;
     }
 }
+/* ---- the camera, through the hardware encoder (while video is open): a frame goes out in parts of 1024 bytes while
+   the radio's send queue keeps 6 of its 16 places free, so the input and the requests for lost video ('N') always
+   find room (measured in wup-os: sent as fast as the queue took them, the parts crowded those out). At most 4 parts a
+   pass (~4 MB/s, a frame is ~50 KB at most): the queue's room shows only once lwIP's thread has passed them on, and a
+   whole frame at once overran lwIP's buffers, losing parts in every frame (2026-11-26). A part not taken is sent
+   again next pass. A frame that comes while the last is still going out is dropped; the computer asks for a new run
+   ('K') when it sees a gap. */
+#define CAMF 0x10000
+static u8 *cam_f, *cam_new;
+static u32 cam_on, cam_want, cam_len, cam_pos, cam_no, cam_sent, cam_drop, cam_idx, cam_asked, cam_busy, cam_restarts;
+static u8 cam_run, cam_seen;
+static void cam(int on) {
+    cam_want = (u32)on;
+    if (on == (int)cam_on || (on && !von)) return;     /* (the encoder needs the decoder running: started with it) */
+    if (on) { if (wup_camera_encode_open()) return; cam_len = cam_pos = 0; cam_seen = 0xff; }
+    else wup_camera_encode_close();
+    cam_on = (u32)on;
+}
+static void cam_poll(void) {
+    for (;;) {
+        int n = wup_camera_encode_read(cam_len ? cam_new : cam_f, CAMF);
+        if (n <= 0) break;
+        u8 run = (u8)wup_camera_encode_starts();
+        if (run != cam_seen) { cam_seen = run; cam_idx = 0; }      /* (a new run: its frames from 0) */
+        if (cam_len) cam_drop++; else { cam_len = (u32)n; cam_pos = 0; cam_no = cam_idx; cam_run = run; }
+        cam_idx++;
+    }
+    for (int parts = 0; cam_len && parts < 4 && wup_net_tx_room() > 6; parts++) {
+        static u8 m[8 + 1024] __attribute__((aligned(4))) = { 'C' };
+        u32 k = cam_len - cam_pos < 1024 ? cam_len - cam_pos : 1024;
+        m[1] = cam_run; m[2] = (u8)(cam_pos / 1024); m[3] = (u8)((cam_len + 1023) / 1024);
+        memcpy(m + 4, &cam_no, 4); memcpy(m + 8, cam_f + cam_pos, k);
+        if (send_peer_ok(m, 8 + k)) { cam_busy++; break; }
+        cam_pos += k;
+        if (cam_pos == cam_len) { cam_len = 0; cam_sent++; }
+    }
+}
+
 /* ---- the backlight: the computer's level while it streams (1..6: the pad's own table, as wupstream counts them; libwup
    takes a percentage), off and on. Told back to the computer as a level (1..6), the menu's own taken to the nearest. */
 static u32 light_now, light_off;
@@ -177,6 +230,7 @@ static void draw_waiting(void) {
     gfx_present_all();
 }
 static void end_session(void) {
+    cam(0); cam_want = 0;                                  /* (the encoder first: it runs beside the decoder) */
     if (shown) { gfx_brightness(0); wup_video_close(); draw_waiting(); }   /* (the screen was the decoder's: drawn again, dark) */
     motor(0, 0); mic(0);
     if (light_off) light_off = 0;
@@ -184,7 +238,7 @@ static void end_session(void) {
     peer_on = von = sync = 0; need_idr = 1;
     if (shown) gfx_fade(0, 256);
     shown = 0;
-    wup_log("wupstream: stream ended");
+    wup_log("wupstream: stream ended\n");
 }
 static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now) {
     u8 h[16] __attribute__((aligned(4)));
@@ -193,14 +247,16 @@ static void packet(const u8 *d, u32 len, const struct sockaddr_in *from, u32 now
     if (n < 4 || (int)(now - quiet_until) < 0) return;
     if (!peer_on && h[0] == 'H') {
         peer_sa = *from; peer_on = 1; need_idr = 1; frames = keys = lost = resent = stalls = full = gap_max = 0; stat_ms = t_start = now;
-        wup_log("wupstream: stream started");
+        wup_log("wupstream: stream started\n");
     }
     if (!peer_on || from->sin_addr.s_addr != peer_sa.sin_addr.s_addr || from->sin_port != peer_sa.sin_port) return;
     last_ms = now;
-    if (h[0] == 'H') { mic(h[2] & 1); light(h[3]); }      /* (hello: byte 2 bit 0 = the microphone, byte 3 = the backlight) */
+    if (h[0] == 'H') { mic(h[2] & 1); cam(h[2] >> 1 & 1); light(h[3]); }   /* (hello: byte 2 bit 0 = the microphone, bit 1 =
+                                                           the camera; byte 3 = the backlight) */
     if (h[0] == 'V' && n == 16) video(d + 16, len, h, now);
     else if (h[0] == 'A' && len > 8) audio(d + 8, len);
     else if (h[0] == 'R') motor(h[1] & 1, now);
+    else if (h[0] == 'K' && cam_on && now - cam_asked > 200) { wup_camera_encode_restart(); cam_asked = now; cam_len = 0; cam_restarts++; }
     else if (h[0] == 'Q') { end_session(); quiet_until = now + 1000; }
 }
 static void tick(u32 now) {                               /* every 1-2 ms */
@@ -221,18 +277,20 @@ static void tick(u32 now) {                               /* every 1-2 ms */
     }
     watchdog(now);
     if (motor_on && now - motor_ms > 100) motor(0, now);
-    if (mic_on) mic_poll();
+    if (mic_on) mic_poll(now);
+    if (cam_want && !cam_on && von) cam(1);               /* (asked for before the first frame: now) */
+    if (cam_on) cam_poll();
     if (now - stat_ms >= 5000) {                             /* every 5 s: what the stream did (tools/padlog.py) */
-        static const char *const name[] = { "frames ", " keyframes ", " lost ", " resent ", " stalls ", " full ", " gap-ms " };
-        u32 v[] = { frames, keys, lost, resent, stalls, full, gap_max };
-        char l[200], *e = l;
-        for (int i = 0; i < 7; i++) {
+        static const char *const name[] = { "frames ", " keyframes ", " lost ", " resent ", " stalls ", " full ", " gap-ms ", " camera ", " camera-dropped ", " camera-busy ", " camera-restarts " };
+        u32 v[] = { frames, keys, lost, resent, stalls, full, gap_max, cam_sent, cam_drop, cam_busy, cam_restarts };
+        char l[300], *e = l;
+        for (int i = 0; i < 11; i++) {
             for (const char *q = name[i]; *q; q++) *e++ = *q;
             char t[12]; int k = 0; u32 x = v[i];
             do t[k++] = (char)('0' + x % 10); while (x /= 10);
             while (k) *e++ = t[--k];
         }
-        *e = 0; wup_log(l); stat_ms = now; gap_max = 0;
+        *e++ = '\n'; *e = 0; wup_log(l); stat_ms = now; gap_max = 0;
     }
     const volatile u8 *report = wup_input_report();
     u16 seq = (u16)(report[0] | report[1] << 8);
@@ -248,6 +306,7 @@ static void tick(u32 now) {                               /* every 1-2 ms */
 int main(void) {
     last_clk = CLOCK;
     for (int i = 0; i < NASM; i++) if (!(as[i].data = malloc(FRAME_MAX))) return 1;   /* (frames put together: 700 KB) */
+    if (!(cam_f = malloc(CAMF)) || !(cam_new = malloc(CAMF))) return 1;
     net_ok = wup_net_init() == 0;
     if (net_ok) {
         sock = socket(AF_INET, SOCK_DGRAM, 0);

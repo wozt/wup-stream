@@ -1,6 +1,6 @@
 /* camera: the GamePad's camera on this computer, as an H.264 stream on stdout; the GamePad shows colour bars meanwhile.
  *   build/host/camera [pad IP] | ffplay -f h264 -flags low_delay -i -
- * Stream (wup-os) must be open on the GamePad; HOME ends it. */
+ * WUP Stream must be open on the GamePad; HOME ends it. */
 #include <stdio.h>
 #include "wupstream.h"
 
